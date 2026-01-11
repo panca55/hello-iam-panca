@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Hand Interactive Particle System</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<!-- Google Font -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Goldman:wght@400;700&family=DotGothic16&display=swap" rel="stylesheet">
+
+<script src="https://cdn.jsdelivr.net/npm/p5@1.9.3/lib/p5.min.js"></script>
+
+<!-- TensorFlow.js Hand Pose Detection -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/hand-pose-detection"></script>
+
+<style>
+body { margin:0; overflow:hidden; background:black; }
+</style>
+</head>
+<body>
+
+<video id="video" playsinline style="display:none"></video>
+
+<script>
+/* ==========================
+   GLOBAL
+========================== */
+let video;
+let detector;
+let videoReady = false;
+let currentHands = []; // Simpan hasil deteksi untuk drawing
+
+// let particles = [];
+let textCache = {};
+let currentTextMode = -1; // -1: not initialized, 0: Hello, 1: I'm Panca Nugraha, 2: よろしくお願いします
+let explosion = false;
+
+// Text mapping
+const TEXT_MODES = [
+  { text: "Hello", hue: 180 },           // Tosca
+  { text: "I'm Panca Nugraha", hue: 60 }, // Kuning
+  { text: "よろしくお願いします", hue: 140 }  // Hijau muda
+];
+
+// hand state
+let rightFingers = 0;
+let leftFingers = 0; // Jumlah jari terbuka di tangan kiri
+let tracking = false;
+let leftHandOpen = false;
+let leftHandPos = null;
+let leftFingerTips = []; // Array posisi ujung jari untuk pressure effect
+
+// Finger count stabilization
+let rightFingerHistory = [];
+const FINGER_HISTORY_LENGTH = 8; // Buffer 8 frame untuk smoothing lebih stabil
+
+// Di global scope
+const MAX_PARTICLES = 1500;
+let particles = [];
+let textPointCount = 0;
+let currentHue = 180; // Warna aktif (default: tosca)
+
+function initParticlesIfNeeded(count) {
+  if (particles.length === 0) {
+    // Buat partikel sekali, lalu pertahankan selamanya
+    for (let i = 0; i < MAX_PARTICLES; i++) {
+      particles.push(new Particle(createVector(random(width), random(height))));
+    }
+  }
+}
+/* ==========================
+   PARTICLE
+========================== */
+class Particle {
+  constructor(pos) {
+    this.pos = pos.copy();
+    this.vel = p5.Vector.random2D().mult(0.5); // mulai pelan
+    this.acc = createVector();
+    this.currentTarget = pos.copy();
+    this.finalTarget = pos.copy();
+    this.size = random(1.5, 3);
+    this.hue = currentHue; // Gunakan warna global
+    this.targetHue = currentHue; // Target warna untuk smooth transition
+    this.exploding = false;
+    this.pressureSize = 1; // Text-pressure scale
+    this.visible = true; // Flag untuk menampilkan/menyembunyikan partikel
+  }
+
+  update() {
+  // Smooth color transition
+  if (abs(this.hue - this.targetHue) > 1) {
+    // Lerp warna dengan smooth transition
+    this.hue = lerp(this.hue, this.targetHue, 0.05);
+  } else {
+    this.hue = this.targetHue;
+  }
+  
+  if (!this.exploding) {
+    // Mode normal: VERY FAST text formation (kecuali ada interaksi tangan kiri)
+    this.currentTarget.lerp(this.finalTarget, 0.25); // Lebih cepat update target
+    let desired = p5.Vector.sub(this.currentTarget, this.pos);
+    let d = desired.mag();
+
+    // Kurangi pull ke target jika ada interaksi tangan kiri
+    let hasInteraction = (leftHandPos && leftFingers > 0 && !leftHandOpen);
+    let targetStrength = hasInteraction ? 0.3 : 1; // Lemahkan pull saat ada interaksi
+
+    if (d > 1) {
+      // Boost kecepatan SANGAT TINGGI saat kembali dari interaksi (transisi smooth)
+      let speedMultiplier = hasInteraction ? targetStrength : 2.5; // Boost 2.5x saat kembali normal
+      
+      let speed = map(d, 0, 300, 0, 30) * speedMultiplier;
+      desired.setMag(speed);
+      let steer = p5.Vector.sub(desired, this.vel).limit(hasInteraction ? 5.5 * targetStrength : 12); // Steering sangat kuat saat kembali
+      this.applyForce(steer);
+    }
+    this.vel.mult(hasInteraction ? 0.88 : 0.85); // Damping lebih rendah saat kembali untuk momentum
+  } else {
+    // Mode explosion: damping rendah untuk fase meledak cepat
+    this.vel.mult(0.96); // Friction lebih rendah untuk explosion lebih cepat
+    
+    // Max speed dinamis: SANGAT tinggi saat meledak, rendah saat floating
+    let maxSpeed = this.vel.mag() > 3 ? 15 : 2; // Switch antara sangat cepat dan lambat
+    if (this.vel.mag() > maxSpeed) {
+      this.vel.setMag(maxSpeed);
+    }
+  }
+
+  this.vel.add(this.acc);
+  this.pos.add(this.vel);
+  this.acc.mult(0);
+
+  // Batas: pantulan sedang
+  if (this.pos.x < 0 || this.pos.x > width) this.vel.x *= this.exploding ? -0.4 : -0.2;
+  if (this.pos.y < 0 || this.pos.y > height) this.vel.y *= this.exploding ? -0.4 : -0.2;
+  this.pos.x = constrain(this.pos.x, 0, width);
+  this.pos.y = constrain(this.pos.y, 0, height);
+}
+  applyForce(f) { this.acc.add(f); }
+
+  draw() {
+    if (!this.visible) return; // Skip partikel yang tidak aktif
+    
+    noStroke();
+    fill(this.hue, 90, 100, 70);
+    
+    // Size dinamis: saat exploding gunakan explosionSize, saat pressure gunakan pressureSize
+    let displaySize = this.size;
+    if (this.exploding && this.explosionSize) {
+      displaySize = this.size * this.explosionSize; // Variasi ukuran untuk depth 3D
+    } else if (this.pressureSize) {
+      displaySize = this.size * this.pressureSize; // Text-pressure effect
+    }
+    
+    circle(this.pos.x, this.pos.y, displaySize);
+  }
+}/* ==========================
+   TEXT POINTS
+========================== */
+function getTextPoints(txt) {
+  if (textCache[txt]) return textCache[txt];
+
+  // Deteksi teks Jepang (cek apakah ada karakter Jepang)
+  const isJapanese = /[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]/.test(txt);
+  
+  // Hanya uppercase untuk teks non-Jepang
+  if (!isJapanese) {
+    txt = txt.toUpperCase();
+  }
+  
+  let pg = createGraphics(width, height);
+  pg.pixelDensity(1);
+  pg.background(0);
+  pg.textAlign(CENTER, CENTER);
+
+  let fontSize;
+  // Font size lebih besar untuk teks Jepang agar tidak tumpuk
+  if (isJapanese) {
+    fontSize = width > 900 ? 70 : 42; // Lebih besar untuk karakter Jepang
+  } else if (txt.length > 15) {
+    fontSize = width > 900 ? 40 : 24;
+  } else if (txt.length > 8) {
+    fontSize = width > 900 ? 80 : 45;
+  } else {
+    fontSize = width > 900 ? 100 : 55;
+  }
+
+  pg.textSize(fontSize);
+  // Gunakan DotGothic16 untuk teks Jepang, Goldman untuk lainnya
+  pg.textFont(isJapanese ? 'DotGothic16' : 'Goldman');
+  pg.textStyle(BOLD);
+  pg.drawingContext.font = `${isJapanese ? '' : 'bold '}${fontSize}px "${isJapanese ? 'DotGothic16' : 'Goldman'}"`;
+  
+  // Untuk teks Jepang, gambar dengan stroke untuk efek bold/tebal
+  if (isJapanese) {
+    pg.drawingContext.strokeStyle = 'white';
+    pg.drawingContext.lineWidth = 3; // Ketebalan stroke
+    pg.drawingContext.strokeText(txt, width / 2, height / 2);
+  }
+  
+  pg.fill(255);
+  pg.text(txt, width / 2, height / 2);
+  pg.loadPixels();
+
+  // ✅ Step lebih besar untuk teks Jepang agar tidak terlalu padat
+  let step;
+  if (isJapanese) {
+    step = 4; // Lebih besar untuk menghindari tumpukan
+  } else if (txt.length > 15) {
+    step = 3;
+  } else if (txt.length > 8) {
+    step = 2.5;
+  } else {
+    step = 2;
+  }
+
+  let pts = [];
+  for (let x = 0; x < width; x += step) {
+    for (let y = 0; y < height; y += step) {
+      let i = (x + y * width) * 4;
+      if (pg.pixels[i] > 200) pts.push(createVector(x, y));
+    }
+  }
+
+  // ✅ JANGAN filter jarak! Biarkan rapat.
+  // ✅ Tapi batasi maksimal agar tidak melebihi MAX_PARTICLES
+  if (pts.length > MAX_PARTICLES) {
+    // Ambil subset secara merata (bukan acak!)
+    let sampled = [];
+    let interval = pts.length / MAX_PARTICLES;
+    for (let i = 0; i < MAX_PARTICLES; i++) {
+      let idx = Math.floor(i * interval);
+      sampled.push(pts[idx]);
+    }
+    pts = sampled;
+  }
+
+  return textCache[txt] = pts;
+}
+function applyText(mode) {
+  if (mode === currentTextMode) return;
+  currentTextMode = mode;
+  explosion = false;
+
+  // Get text and color from mode
+  const textData = TEXT_MODES[mode];
+  const txt = textData.text;
+  currentHue = textData.hue;
+
+  let pts = getTextPoints(txt);
+
+  // Inisialisasi partikel sekali
+  if (particles.length === 0) {
+    for (let i = 0; i < MAX_PARTICLES; i++) {
+      // Mulai dari pusat layar → lebih rapi daripada acak
+      particles.push(new Particle(createVector(width / 2, height / 2)));
+    }
+  } else {
+    // Update target warna semua partikel existing untuk smooth transition
+    particles.forEach(p => p.targetHue = currentHue);
+  }
+
+  // ✅ Assign finalTarget: hanya gunakan partikel sesuai jumlah points
+  for (let i = 0; i < particles.length; i++) {
+    if (i < pts.length && pts.length > 0) {
+      particles[i].finalTarget.set(pts[i]);
+      particles[i].visible = true; // Aktifkan partikel
+    } else {
+      // Partikel ekstra: nonaktifkan
+      particles[i].visible = false;
+      particles[i].finalTarget.set(width / 2, height / 2);
+    }
+  }
+}
+
+/* ==========================
+   MEDIAPIPE
+========================== */
+async function detectHands() {
+  if (!videoReady || !detector) return;
+  
+  const hands = await detector.estimateHands(video.elt, {
+    flipHorizontal: false
+  });
+  
+  currentHands = hands; // Simpan untuk drawing
+  processHands(hands);
+}
+
+function processHands(hands) {
+  tracking = false;
+  rightFingers = 0;
+  leftFingers = 0; // Reset left fingers
+  leftHandOpen = false;
+  leftHandPos = null;
+  leftFingerTips = [];
+
+  if (hands && hands.length > 0) {
+    tracking = true;
+
+    for (let hand of hands) {
+      const keypoints = hand.keypoints;
+      const handedness = hand.handedness; // 'Left' atau 'Right' (dari perspektif kamera)
+      
+      // Konversi ke normalized coordinates
+      const lm = keypoints.map(kp => ({
+        x: kp.x / video.width,
+        y: kp.y / video.height
+      }));
+      
+      const centerX = lm[9].x;
+
+      if (centerX < 0.5) { // Tangan kanan user
+        let count = 0;
+        
+        // Ibu jari (thumb) - deteksi horizontal dengan threshold lebih longgar
+        if (lm[4].x < lm[3].x - 0.03) count++;
+        
+        // Jari telunjuk (index) - threshold lebih longgar
+        if (lm[8].y < lm[6].y - 0.025) count++;
+        
+        // Jari tengah (middle)
+        if (lm[12].y < lm[10].y - 0.02) count++;
+        
+        // Jari manis (ring)
+        if (lm[16].y < lm[14].y - 0.02) count++;
+        
+        // Jari kelingking (pinky)
+        if (lm[20].y < lm[18].y - 0.02) count++;
+        
+        // Smoothing: tambahkan ke history buffer
+        rightFingerHistory.push(count);
+        if (rightFingerHistory.length > FINGER_HISTORY_LENGTH) {
+          rightFingerHistory.shift();
+        }
+        
+        // Gunakan mode (nilai paling sering) dari history untuk stabilitas
+        let smoothedCount = count;
+        if (rightFingerHistory.length >= FINGER_HISTORY_LENGTH) {
+          // Hitung frekuensi setiap nilai
+          let freq = {};
+          rightFingerHistory.forEach(val => freq[val] = (freq[val] || 0) + 1);
+          // Ambil nilai dengan frekuensi tertinggi
+          let maxFreq = Math.max(...Object.values(freq));
+          // Butuh minimal 60% konsistensi (5 dari 8 frame) untuk berubah state
+          if (maxFreq >= Math.ceil(FINGER_HISTORY_LENGTH * 0.6)) {
+            smoothedCount = parseInt(Object.keys(freq).reduce((a, b) => freq[a] > freq[b] ? a : b));
+          } else {
+            // Jika tidak cukup konsisten, pertahankan state sebelumnya
+            smoothedCount = rightFingers;
+          }
+        }
+        
+        rightFingers = smoothedCount;
+
+        if (smoothedCount === 1) applyText(0); // Hello
+        else if (smoothedCount === 2) applyText(1); // I'm Panca Nugraha
+        else if (smoothedCount === 3) applyText(2); // よろしくお願いします
+        else if (smoothedCount === 0) {
+          // Sembunyikan semua partikel ketika tidak ada jari terbuka
+          particles.forEach(p => p.visible = false);
+          // Reset currentTextMode agar applyText bisa dipanggil ulang saat kembali ke 1
+          currentTextMode = -1;
+        }
+      }
+
+      if (centerX > 0.5) { // Tangan kiri user
+        let openCount = 0;
+        let indexFingerOpen = false;
+        
+        // Cek jari telunjuk terbuka dengan threshold ketat
+        if (lm[8].y < lm[6].y - 0.05) {
+          openCount++;
+          indexFingerOpen = true;
+        }
+        
+        // Cek jari lain
+        if (lm[12].y < lm[10].y - 0.015) openCount++;
+        if (lm[16].y < lm[14].y - 0.015) openCount++;
+        if (lm[20].y < lm[18].y - 0.015) openCount++;
+        
+        leftFingers = openCount; // Update jumlah jari terbuka
+        leftHandOpen = openCount >= 3;
+        // Flip horizontal untuk match dengan video
+        leftHandPos = createVector(width - (lm[9].x * width), lm[9].y * height);
+        
+        // PRESSURE: HANYA jika jari telunjuk terbuka DAN total jari terbuka <= 2
+        if (indexFingerOpen && openCount <= 2) {
+          leftFingerTips = [
+            createVector(width - (lm[8].x * width), lm[8].y * height)
+          ];
+        } else {
+          leftFingerTips = [];
+        }
+      }
+    }
+  }
+}
+
+function drawHandLandmarks() {
+  if (!currentHands || currentHands.length === 0) return;
+  
+  push();
+  // Flip horizontal untuk match dengan video
+  translate(width, 0);
+  scale(-1, 1);
+  
+  // Hand connections (MediaPipe hand model)
+  const connections = [
+    [0, 1], [1, 2], [2, 3], [3, 4], // Thumb
+    [0, 5], [5, 6], [6, 7], [7, 8], // Index
+    [0, 9], [9, 10], [10, 11], [11, 12], // Middle
+    [0, 13], [13, 14], [14, 15], [15, 16], // Ring
+    [0, 17], [17, 18], [18, 19], [19, 20], // Pinky
+    [5, 9], [9, 13], [13, 17] // Palm
+  ];
+  
+  for (let hand of currentHands) {
+    const keypoints = hand.keypoints;
+    const scaleX = width / video.width;
+    const scaleY = height / video.height;
+    
+    // Draw connections
+    stroke(0, 100, 100, 80);
+    strokeWeight(2);
+    for (let connection of connections) {
+      const kp1 = keypoints[connection[0]];
+      const kp2 = keypoints[connection[1]];
+      line(
+        kp1.x * scaleX, kp1.y * scaleY,
+        kp2.x * scaleX, kp2.y * scaleY
+      );
+    }
+    
+    // Draw landmarks
+    noStroke();
+    for (let i = 0; i < keypoints.length; i++) {
+      const kp = keypoints[i];
+      // Warna berbeda untuk jari telunjuk (index 8)
+      if (i === 8) {
+        fill(60, 100, 100, 90); // Yellow untuk telunjuk
+      } else if (i === 9) {
+        fill(180, 100, 100, 90); // Cyan untuk palm center
+      } else {
+        fill(0, 100, 100, 80); // Red untuk lainnya
+      }
+      circle(kp.x * scaleX, kp.y * scaleY, i === 0 ? 10 : 6);
+    }
+  }
+  
+  pop();
+}
+
+function interactWithLeftHand() {
+  if (leftHandOpen && leftHandPos) {
+    explosion = true;
+    
+    particles.forEach(p => {
+      p.exploding = true;
+      let d = p5.Vector.sub(p.pos, leftHandPos);
+      let dist = d.mag();
+      
+      // PARTIKEL MEMBENTUK SPHERE/BOLA di sekitar tangan
+      
+      // Assign random target - radius lebih konsisten untuk bentuk bola
+      if (!p.explosionRadius) {
+        p.explosionRadius = random(200, 350); // Radius lebih compact untuk bentuk sphere
+        p.explosionSize = random(0.8, 2.5); // Variasi ukuran lebih kecil
+        p.fragmentAngle = random(TWO_PI); // Sudut fragmentasi unik
+      }
+      
+      let targetRadius = p.explosionRadius;
+      let handExclusionZone = 80; // Zona eksklusi lebih besar
+      
+      // ZONA EKSKLUSI TANGAN: dorong partikel keluar agar tidak menutupi tangan
+      if (dist < handExclusionZone) {
+        let pushAway = d.copy();
+        let force = map(dist, 0, handExclusionZone, 50, 20); // Force lebih kuat dan smooth
+        pushAway.setMag(force);
+        p.applyForce(pushAway);
+        return; // Skip logic lainnya jika terlalu dekat tangan
+      }
+      
+      if (dist < targetRadius - 30) {
+        // FASE MELEDAK: dorong keluar dengan force besar SANGAT CEPAT
+        let force = map(dist, handExclusionZone, targetRadius - 30, 35, 20); // Force lebih tinggi
+        d.setMag(force);
+        p.applyForce(d);
+        
+        // Kurangi directional force agar lebih berbentuk sphere
+        let fragmentDir = createVector(cos(p.fragmentAngle), sin(p.fragmentAngle));
+        fragmentDir.mult(random(2, 5)); // Force lebih kecil untuk sphere
+        p.applyForce(fragmentDir);
+        
+        // Repulsion: tolak partikel yang terlalu dekat
+        particles.forEach(other => {
+          if (other !== p) {
+            let separation = p5.Vector.sub(p.pos, other.pos);
+            let separationDist = separation.mag();
+            if (separationDist < 25 && separationDist > 0) {
+              separation.setMag(4);
+              p.applyForce(separation);
+            }
+          }
+        });
+        
+      } else if (dist > targetRadius + 30) {
+        // Terlalu jauh: tarik kembali dengan force lebih kuat untuk sphere
+        let pullBack = p5.Vector.sub(leftHandPos, p.pos);
+        let force = map(dist, targetRadius + 30, targetRadius + 150, 2, 8); // Pull back lebih kuat
+        pullBack.setMag(force);
+        p.applyForce(pullBack);
+        
+      } else {
+        // FASE FLOATING: di target radius - sphere formation
+        
+        // Drift minimal untuk maintain sphere shape
+        let fragmentDrift = createVector(cos(p.fragmentAngle), sin(p.fragmentAngle));
+        fragmentDrift.mult(random(0.05, 0.15));
+        p.applyForce(fragmentDrift);
+        
+        // Random drift minimal
+        let driftForce = p5.Vector.random2D().mult(random(0.1, 0.3));
+        p.applyForce(driftForce);
+        
+        // Gentle correction untuk maintain sphere
+        if (dist < targetRadius - 20) {
+          d.setMag(0.3);
+          p.applyForce(d);
+        } else if (dist > targetRadius + 20) {
+          let pullBack = p5.Vector.sub(leftHandPos, p.pos);
+          pullBack.setMag(0.3);
+          p.applyForce(pullBack);
+        }
+      }
+    });
+  } else {
+    explosion = false;
+    particles.forEach(p => {
+      p.exploding = false;
+      p.explosionRadius = null;
+      p.explosionSize = null;
+      p.fragmentAngle = null;
+    });
+    
+    // ANTIGRAVITY + TEXT-PRESSURE: saat tangan kiri tidak terbuka
+    // HANYA jika ada jari terbuka (leftFingers > 0)
+    if (leftHandPos && leftFingers > 0) {
+      particles.forEach(p => {
+        
+        // TEXT-PRESSURE: HANYA jika jari telunjuk terbuka (leftFingerTips tidak kosong)
+        let minDistToFinger = Infinity;
+        let closestFingerTip = null;
+        if (leftFingerTips.length > 0 && !leftHandOpen) { // Jari telunjuk terbuka tapi bukan explosion
+          leftFingerTips.forEach(fingerTip => {
+            let distToFinger = p5.Vector.dist(p.pos, fingerTip);
+            if (distToFinger < minDistToFinger) {
+              minDistToFinger = distToFinger;
+              closestFingerTip = fingerTip;
+            }
+          });
+          
+          // Pressure effect based on closest finger
+          let pressureRadius = 100; // Radius per jari
+          if (minDistToFinger < pressureRadius) {
+            // Semakin dekat jari = semakin besar
+            let pressureScale = map(minDistToFinger, pressureRadius, 0, 1, 5);
+            p.pressureSize = constrain(pressureScale, 1, 5);
+            
+            // DORONG PARTIKEL MENJAUH DARI JARI (pressure push)
+            let pushFromFinger = p5.Vector.sub(p.pos, closestFingerTip);
+            let pushStrength = map(minDistToFinger, pressureRadius, 0, 1, 8); // Kuat saat dekat
+            pushFromFinger.setMag(pushStrength);
+            p.applyForce(pushFromFinger);
+          } else {
+            p.pressureSize = 1;
+          }
+        } else {
+          p.pressureSize = 1;
+        }
+        
+        // ANTIGRAVITY: untuk ring formation di sekitar pusat tangan
+        let d = p5.Vector.sub(p.pos, leftHandPos);
+        let dist = d.mag();
+        
+        let magnetRadius = 250; // Radius magnetic field
+        let ringRadius = 180; // Radius ring formation
+        
+        if (dist > 60 && dist < magnetRadius) {
+          // ANTIGRAVITY: tarik partikel ke ring formation
+          
+          if (dist < ringRadius - 30) {
+            // Terlalu dekat: dorong keluar ke ring
+            let pushForce = map(dist, 60, ringRadius - 30, 2, 6);
+            d.setMag(pushForce);
+            p.applyForce(d);
+          } else if (dist > ringRadius + 30) {
+            // Terlalu jauh: tarik masuk ke ring
+            let pullForce = map(dist, ringRadius + 30, magnetRadius, 8, 1);
+            let pull = p5.Vector.sub(leftHandPos, p.pos);
+            pull.setMag(pullForce);
+            p.applyForce(pull);
+          } else {
+            // Di ring: drift melingkar
+            let angle = atan2(d.y, d.x);
+            let tangent = createVector(-sin(angle), cos(angle));
+            tangent.mult(0.5); // Rotation speed
+            p.applyForce(tangent);
+            
+            // Wave effect
+            let wave = sin(frameCount * 0.05 + angle * 3) * 0.8;
+            let waveForce = d.copy().setMag(wave);
+            p.applyForce(waveForce);
+          }
+        } else if (dist <= 60 && minDistToFinger > 30) {
+          // Zona dekat tapi tidak dekat jari: gentle push
+          let gentlePush = map(dist, 0, 60, 0.5, 0);
+          d.setMag(gentlePush);
+          p.applyForce(d);
+        }
+      });
+    } else {
+      // Reset pressure saat tidak ada tangan
+      particles.forEach(p => p.pressureSize = 1);
+    }
+  }
+}
+
+/* ==========================
+   P5 SETUP & DRAW
+========================== */
+async function setup() {
+  createCanvas(windowWidth, windowHeight);
+  colorMode(HSB, 360, 100, 100, 100);
+
+  video = createCapture(VIDEO);
+  video.size(640, 480);
+  video.hide();
+  
+  video.elt.addEventListener('loadeddata', async () => {
+    videoReady = true;
+    console.log('Video ready');
+  });
+
+  // Initialize TensorFlow Hand Pose Detection
+  const model = handPoseDetection.SupportedModels.MediaPipeHands;
+  const detectorConfig = {
+    runtime: 'mediapipe',
+    solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/hands',
+    maxHands: 2,
+    modelType: 'full'
+  };
+  
+  detector = await handPoseDetection.createDetector(model, detectorConfig);
+  console.log('Detector initialized');
+
+  applyText(0); // Start with Hello
+}
+
+function draw() {
+  background(0, 0, 0, 20); // Transparan sedikit untuk trail lembut
+
+  if (videoReady) {
+    push();
+    tint(255, 30);
+    translate(width, 0);
+    scale(-1, 1);
+    image(video, 0, 0, width, height);
+    pop();
+    
+    // Detect hands setiap frame
+    detectHands();
+  }
+
+  interactWithLeftHand();
+
+  for (let p of particles) {
+    p.update();
+    p.draw();
+  }
+
+  drawHUD();
+}
+
+function drawHUD() {
+  push();
+  fill(220, 80, 20, 30);
+  stroke(0, 0, 100, 60);
+  strokeWeight(1.5);
+  rect(20, 20, 260, 110, 12);
+  noStroke();
+  fill(0, 0, 100);
+  textSize(10);
+  textStyle(BOLD);
+  text(`Tracking: ${tracking ? "ACTIVE" : "IDLE"}`, 35, 45);
+  textStyle(NORMAL);
+  textSize(13);
+  text(`Right Fingers: ${rightFingers}`, 35, 65);
+  text(`Left Fingers: ${leftFingers}`, 35, 85);
+  text(`Mode: ${explosion ? "EXPLODE" : "FORMING"}`, 35, 105);
+  pop();
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+  textCache = {};
+  applyText(currentTextMode);
+}
+</script>
+</body>
+</html>
